@@ -1,0 +1,26 @@
+resources:
+  pipelines:
+    transformation_pipeline:
+      name: cru-transformation
+      catalog: ${var.catalog}
+      schema: silver
+      edition: ADVANCED # AUTO CDC and expectations
+      clusters:
+        - label: default
+          node_type_id: Standard_D4s_v5
+          num_workers: 0
+          policy_id: ${var.cluster_policy_id}
+          spark_conf:
+            spark.databricks.cluster.profile: singleNode
+            spark.master: "local[*]"
+          custom_tags:
+            ResourceClass: SingleNode
+            environment: ${bundle.target}
+            project: ${bundle.name}
+      # Lets the pipeline files import silver.parsing and gold.modeling from src
+      root_path: ../../src
+      libraries:
+        - file:
+            path: ../../src/silver/pipeline.py
+        - file:
+            path: ../../src/gold/pipeline.py

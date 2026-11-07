@@ -1,0 +1,59 @@
+name: databricks-checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "databricks.yml"
+      - "resources/**"
+      - "src/**"
+      - ".github/workflows/databricks-checks.yml"
+      - ".github/scripts/export-bundle-env.sh"
+
+concurrency:
+  group: databricks-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: databricks bundle validate (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [dev, prod]
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: databricks/setup-cli@v1.21.0
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      # Prod is skipped until its infrastructure is applied, dev must already exist
+      - name: read Terraform outputs
+        id: terraform
+        env:
+          TFSTATE_RESOURCE_GROUP: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+        run: bash .github/scripts/export-bundle-env.sh "$TARGET" "${{ matrix.target == 'prod' }}"
+
+      - name: databricks bundle validate
+        if: steps.terraform.outputs.available == 'true'
+        env:
+          BUNDLE_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+          BUNDLE_VAR_job_sp_application_id: ${{ matrix.target == 'prod' && vars.PROD_JOB_SP_APPLICATION_ID || vars.DEV_JOB_SP_APPLICATION_ID }}
+          BUNDLE_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+          BUNDLE_VAR_environment_group_name: ${{ matrix.target == 'prod' && vars.PROD_GROUP_NAME || vars.DEV_GROUP_NAME }}
+          BUNDLE_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+        run: databricks bundle validate -t "$TARGET"

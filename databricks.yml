@@ -1,0 +1,65 @@
+bundle:
+  name: cru-lakehouse
+
+artifacts:
+  cru_ingestion:
+    type: whl
+    build: uv build --wheel
+
+sync:
+  paths:
+    - src
+
+run_as:
+  service_principal_name: ${var.job_sp_application_id}
+
+presets:
+  tags:
+    project: ${bundle.name}
+    environment: ${bundle.target}
+
+permissions:
+  - service_principal_name: ${var.job_sp_application_id}
+    level: CAN_RUN
+  - group_name: ${var.admins_group_name}
+    level: CAN_MANAGE
+  - service_principal_name: ${var.deploy_sp_application_id}
+    level: CAN_MANAGE
+  - group_name: ${var.environment_group_name}
+    level: CAN_VIEW
+
+variables:
+  catalog:
+    description: Unity Catalog catalog for this environment
+  job_sp_application_id:
+    description: Application ID of the service principal that jobs and pipelines run as. Set via BUNDLE_VAR_job_sp_application_id
+  deploy_sp_application_id:
+    description: Application ID of the deploy service principal. Set via BUNDLE_VAR_deploy_sp_application_id
+  admins_group_name:
+    description: Display name of the admins Entra ID group. Set via BUNDLE_VAR_admins_group_name
+  environment_group_name:
+    description: Display name of the target environment's Entra ID group. Set via BUNDLE_VAR_environment_group_name
+  cluster_policy_id:
+    description: ID of the cluster policy for job and pipeline clusters, from the cluster_policy_id output of infra/envs/<target>/02-databricks. Set via BUNDLE_VAR_cluster_policy_id
+  alert_email:
+    description: Address notified when the ingestion job fails or runs longer than an hour. Set via BUNDLE_VAR_alert_email
+
+include:
+  - resources/jobs/*.yml
+  - resources/pipelines/*.yml
+  - resources/dashboards/*.yml
+
+# Targets set no workspace.host - CI sets DATABRICKS_HOST from Terraform
+targets:
+  dev:
+    mode: development
+    default: true
+    variables:
+      catalog: cru_dev
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Workspace/cru-lakehouse
+    variables:
+      catalog: cru_prod

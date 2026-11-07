@@ -1,0 +1,98 @@
+resources:
+  jobs:
+    ingestion_job:
+      name: cru-ingestion
+      health:
+        rules:
+          - metric: RUN_DURATION_SECONDS
+            op: GREATER_THAN
+            value: 3600 # 1h
+      # The run fails only when bronze or transformation fails, so the tasks before bronze alert on their own
+      email_notifications:
+        on_failure:
+          - ${var.alert_email}
+        on_duration_warning_threshold_exceeded:
+          - ${var.alert_email}
+      schedule:
+        # Paused automatically in development mode
+        quartz_cron_expression: "0 0 3 * * ?" # 03:00
+        timezone_id: Europe/Warsaw
+      parameters:
+        - name: backfill
+          default: "0"
+        - name: date_from
+          default: ""
+        - name: date_to
+          default: ""
+      job_clusters:
+        - job_cluster_key: ingestion_cluster
+          new_cluster:
+            spark_version: 18.x-scala2.13
+            node_type_id: Standard_D4s_v5
+            num_workers: 0
+            data_security_mode: SINGLE_USER
+            single_user_name: ${var.job_sp_application_id}
+            spark_conf:
+              spark.databricks.cluster.profile: singleNode
+              spark.master: "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+            policy_id: ${var.cluster_policy_id}
+            spark_env_vars:
+              CATALOG: ${var.catalog}
+              LANDING_VOLUME_PATH: /Volumes/${var.catalog}/landing/raw_agreements
+              LEDGER_TABLE: ${var.catalog}.landing._ingestion_ledger
+      tasks:
+        - task_key: compute_pending_days
+          job_cluster_key: ingestion_cluster
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          python_wheel_task:
+            package_name: cru_ingestion
+            entry_point: compute_pending_days
+            named_parameters:
+              backfill: "{{job.parameters.backfill}}"
+              date_from: "{{job.parameters.date_from}}"
+              date_to: "{{job.parameters.date_to}}"
+          libraries:
+            - whl: ../../dist/*.whl
+        - task_key: process_days
+          depends_on:
+            - task_key: compute_pending_days
+          email_notifications:
+            on_failure:
+              - ${var.alert_email}
+          for_each_task:
+            inputs: "{{tasks.compute_pending_days.values.pending_days}}"
+            concurrency: 2
+            task:
+              task_key: process_day
+              job_cluster_key: ingestion_cluster
+              max_retries: 2
+              min_retry_interval_millis: 300000 # 5m
+              python_wheel_task:
+                package_name: cru_ingestion
+                entry_point: process_day
+                named_parameters:
+                  day: "{{input}}"
+              libraries:
+                - whl: ../../dist/*.whl
+        - task_key: bronze
+          depends_on:
+            - task_key: process_days
+          # Loads what landed even when some days failed, since the next run picks those days up again
+          run_if: ALL_DONE
+          # Auto Loader stops once on a new JSON field and picks it up on the retry
+          max_retries: 1
+          job_cluster_key: ingestion_cluster
+          notebook_task:
+            notebook_path: ../../src/bronze/bronze.py
+          # The notebook imports Settings from the cru_ingestion wheel
+          libraries:
+            - whl: ../../dist/*.whl
+        - task_key: transformation
+          depends_on:
+            - task_key: bronze
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.transformation_pipeline.id}
