@@ -1,0 +1,15 @@
+subscription_id = "00000000-0000-0000-0000-000000000000"
+tenant_id       = "00000000-0000-0000-0000-000000000000"
+
+github_sub_claim_prefix = "repo:OWNER@OWNER_ID/REPO@REPO_ID"
+
+name_overrides = {
+  deploy_sp           = "sp-cru-lakehouse"
+  databricks_admin_sp = "sp-cru-databricks-admin"
+  dev_job_sp          = "sp-cru-dev-dbw-job"
+  prod_job_sp         = "sp-cru-prod-dbw-job"
+  dev_group           = "az-cru-dev"
+  prod_group          = "az-cru-prod"
+  # Storage account names are globally unique, override if the derived one is taken
+  # tfstate_storage_account = "stcrulakehousetfstate2"
+}

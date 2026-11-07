@@ -1,0 +1,343 @@
+name: terraform-checks
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - ".github/workflows/terraform-checks.yml"
+      - ".github/scripts/export-workspace-ids.sh"
+      - ".tflint.hcl"
+      - ".trivyignore.yaml"
+
+concurrency:
+  group: terraform-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  terraform-fmt:
+    name: terraform fmt (check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+      - run: terraform fmt -check -recursive infra/
+
+  terraform-validate:
+    name: terraform init / validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root: [bootstrap, envs/dev/01-azure, envs/dev/02-databricks, envs/prod/01-azure, envs/prod/02-databricks, envs/account]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init (no backend)
+        working-directory: infra/${{ matrix.root }}
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        working-directory: infra/${{ matrix.root }}
+        run: terraform validate
+
+  # One recursive run lints every root and module under infra/
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.64.0
+
+      - name: tflint init
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: tflint
+        working-directory: infra
+        run: tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl"
+
+  terraform-test:
+    name: terraform test (modules)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [storage_account, service_principal]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform test
+        working-directory: infra/modules/${{ matrix.module }}
+        run: |
+          terraform init -backend=false
+          terraform test
+
+  trivy-scan:
+    name: trivy config scan
+    needs: [terraform-fmt, terraform-validate, tflint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: config
+          scan-ref: infra/
+          trivyignores: .trivyignore.yaml
+          exit-code: "1"
+
+  terraform-plan:
+    name: terraform plan
+    needs: [terraform-fmt, terraform-validate, tflint]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [dev, prod]
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_dev_group_object_id: ${{ vars.DEV_GROUP_OBJECT_ID }}
+      TF_VAR_prod_group_object_id: ${{ vars.PROD_GROUP_OBJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init (01-azure)
+        working-directory: infra/envs/${{ matrix.env }}/01-azure
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=${{ matrix.env }}/01-azure.tfstate"
+
+      - name: terraform plan (01-azure)
+        working-directory: infra/envs/${{ matrix.env }}/01-azure
+        run: |
+          set -o pipefail
+          terraform plan -no-color -out=tfplan | tee plan-output.txt
+
+      # available=false skips 02-databricks while any of these outputs is missing from 01-azure's state
+      - name: capture 01-azure outputs for 02-databricks
+        id: azure_outputs
+        working-directory: infra/envs/${{ matrix.env }}/01-azure
+        run: |
+          # Treats an empty output as missing
+          get_output() {
+            local value
+            value=$(terraform output -raw "$1" 2>/dev/null) || return 1
+            [ -n "$value" ] && printf '%s' "$value"
+          }
+
+          if WORKSPACE_URL=$(get_output workspace_url) &&
+             WORKSPACE_ID=$(get_output workspace_id) &&
+             ACCESS_CONNECTOR_ID=$(get_output access_connector_id) &&
+             STORAGE_ACCOUNT_NAME=$(get_output storage_account_name) &&
+             RESOURCE_GROUP_NAME=$(get_output resource_group_name) &&
+             LANDING_CONTAINER_NAME=$(get_output landing_container_name) &&
+             CATALOG_CONTAINER_NAME=$(get_output catalog_container_name); then
+            printf 'available=true\n' >> "$GITHUB_OUTPUT"
+            {
+              printf 'workspace_url=%s\n' "$WORKSPACE_URL"
+              printf 'workspace_id=%s\n' "$WORKSPACE_ID"
+              printf 'access_connector_id=%s\n' "$ACCESS_CONNECTOR_ID"
+              printf 'storage_account_name=%s\n' "$STORAGE_ACCOUNT_NAME"
+              printf 'resource_group_name=%s\n' "$RESOURCE_GROUP_NAME"
+              printf 'landing_container_name=%s\n' "$LANDING_CONTAINER_NAME"
+              printf 'catalog_container_name=%s\n' "$CATALOG_CONTAINER_NAME"
+            } >> "$GITHUB_OUTPUT"
+          else
+            printf 'available=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only prod uses an NCC
+      - name: capture 01-azure NCC outputs for prod 02-databricks
+        if: matrix.env == 'prod' && steps.azure_outputs.outputs.available == 'true'
+        working-directory: infra/envs/prod/01-azure
+        run: |
+          storage_account_id=$(terraform output -raw storage_account_id)
+          location=$(terraform output -raw location)
+          printf 'TF_VAR_storage_account_id=%s\nTF_VAR_location=%s\n' "$storage_account_id" "$location" >> "$GITHUB_ENV"
+
+      - name: terraform init (02-databricks)
+        if: steps.azure_outputs.outputs.available == 'true'
+        working-directory: infra/envs/${{ matrix.env }}/02-databricks
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=${{ matrix.env }}/02-databricks.tfstate"
+
+      - name: terraform plan (02-databricks)
+        if: steps.azure_outputs.outputs.available == 'true'
+        working-directory: infra/envs/${{ matrix.env }}/02-databricks
+        env:
+          DATABRICKS_TF_ENABLED_PF_RESOURCES: databricks_mws_ncc_private_endpoint_rule
+          TF_VAR_databricks_account_id: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+          TF_VAR_databricks_admin_sp_application_id: ${{ vars.DATABRICKS_ADMIN_CLIENT_ID }}
+          TF_VAR_databricks_host: ${{ steps.azure_outputs.outputs.workspace_url }}
+          TF_VAR_databricks_workspace_id: ${{ steps.azure_outputs.outputs.workspace_id }}
+          TF_VAR_access_connector_id: ${{ steps.azure_outputs.outputs.access_connector_id }}
+          TF_VAR_storage_account_name: ${{ steps.azure_outputs.outputs.storage_account_name }}
+          TF_VAR_resource_group_name: ${{ steps.azure_outputs.outputs.resource_group_name }}
+          TF_VAR_landing_container_name: ${{ steps.azure_outputs.outputs.landing_container_name }}
+          TF_VAR_catalog_container_name: ${{ steps.azure_outputs.outputs.catalog_container_name }}
+          TF_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+          TF_VAR_dev_job_sp_application_id: ${{ vars.DEV_JOB_SP_APPLICATION_ID }}
+          TF_VAR_prod_job_sp_application_id: ${{ vars.PROD_JOB_SP_APPLICATION_ID }}
+          TF_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+          TF_VAR_dev_group_name: ${{ vars.DEV_GROUP_NAME }}
+          TF_VAR_prod_group_name: ${{ vars.PROD_GROUP_NAME }}
+        run: |
+          set -o pipefail
+          terraform plan -no-color -out=tfplan | tee plan-output.txt
+
+      # One comment per env, covering both 01-azure and 02-databricks
+      - name: post plan as PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MARKER="<!-- terraform-checks-plan:${{ matrix.env }} -->"
+          AZURE_FILE="infra/envs/${{ matrix.env }}/01-azure/plan-output.txt"
+          DATABRICKS_FILE="infra/envs/${{ matrix.env }}/02-databricks/plan-output.txt"
+          AZURE_SUMMARY=$(grep -E "^(Plan:|No changes)" "$AZURE_FILE" || echo "Plan summary unavailable - check the log below")
+
+          {
+            printf '### Terraform plan - `%s`\n\n' "${{ matrix.env }}"
+            printf '**01-azure: %s**\n\n' "$AZURE_SUMMARY"
+            printf '<details><summary>Show 01-azure plan</summary>\n\n```\n'
+            cat "$AZURE_FILE"
+            printf '```\n\n</details>\n\n'
+
+            if [ -f "$DATABRICKS_FILE" ]; then
+              DATABRICKS_SUMMARY=$(grep -E "^(Plan:|No changes)" "$DATABRICKS_FILE" || echo "Plan summary unavailable - check the log below")
+              printf '**02-databricks: %s**\n\n' "$DATABRICKS_SUMMARY"
+              printf '<details><summary>Show 02-databricks plan</summary>\n\n```\n'
+              cat "$DATABRICKS_FILE"
+              printf '```\n\n</details>\n'
+            else
+              printf '**02-databricks: skipped** - `%s/01-azure` needs applying first.\n' "${{ matrix.env }}"
+            fi
+
+            printf '\n%s\n' "$MARKER"
+          } > comment-body.md
+
+          # Find the existing comment by marker so each env updates its own comment on new pushes
+          EXISTING_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\"))] | last | .id // empty")
+
+          if [ -n "$EXISTING_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_ID" -X PATCH -F body=@comment-body.md
+          else
+            gh pr comment ${{ github.event.pull_request.number }} --body-file comment-body.md
+          fi
+
+  terraform-plan-account:
+    name: terraform plan (account)
+    needs: [terraform-fmt, terraform-validate, tflint]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    env:
+      ARM_CLIENT_ID: ${{ vars.DATABRICKS_ADMIN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_databricks_account_id: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+      TF_VAR_dev_group_object_id: ${{ vars.DEV_GROUP_OBJECT_ID }}
+      TF_VAR_prod_group_object_id: ${{ vars.PROD_GROUP_OBJECT_ID }}
+      TF_VAR_admins_group_object_id: ${{ vars.ADMINS_GROUP_OBJECT_ID }}
+      TF_VAR_dev_job_sp_application_id: ${{ vars.DEV_JOB_SP_APPLICATION_ID }}
+      TF_VAR_prod_job_sp_application_id: ${{ vars.PROD_JOB_SP_APPLICATION_ID }}
+      TF_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+      TF_VAR_dev_group_name: ${{ vars.DEV_GROUP_NAME }}
+      TF_VAR_prod_group_name: ${{ vars.PROD_GROUP_NAME }}
+      TF_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: export workspace IDs
+        env:
+          TFSTATE_RESOURCE_GROUP: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+        run: bash .github/scripts/export-workspace-ids.sh
+
+      - name: terraform init
+        working-directory: infra/envs/account
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=account.tfstate"
+
+      - name: terraform plan
+        working-directory: infra/envs/account
+        run: |
+          set -o pipefail
+          terraform plan -no-color -lock-timeout=15m -out=tfplan | tee plan-output.txt
+
+      - name: post plan as PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MARKER="<!-- terraform-checks-plan:account -->"
+          FILE="infra/envs/account/plan-output.txt"
+          SUMMARY=$(grep -E "^(Plan:|No changes)" "$FILE" || echo "Plan summary unavailable - check the log below")
+
+          {
+            printf '### Terraform plan - `account`\n\n'
+            printf '**%s**\n\n' "$SUMMARY"
+            printf '<details><summary>Show plan</summary>\n\n```\n'
+            cat "$FILE"
+            printf '```\n\n</details>\n\n%s\n' "$MARKER"
+          } > comment-body.md
+
+          EXISTING_ID=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\"))] | last | .id // empty")
+
+          if [ -n "$EXISTING_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING_ID" -X PATCH -F body=@comment-body.md
+          else
+            gh pr comment ${{ github.event.pull_request.number }} --body-file comment-body.md
+          fi

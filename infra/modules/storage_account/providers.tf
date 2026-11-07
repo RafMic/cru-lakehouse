@@ -1,0 +1,11 @@
+# Uses public_network_access on azurerm_storage_account, available from azurerm 5.5.0
+terraform {
+  required_version = ">= 1.15.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = ">= 5.5.0, < 6.0.0"
+    }
+  }
+}
