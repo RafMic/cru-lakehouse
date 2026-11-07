@@ -174,7 +174,7 @@ Then run `databricks-deploy-prod.yml`, which also waits for a `prod` reviewer an
 
 ### Dev without network isolation
 
-Dev skips prod's private networking to save cost. A storage firewall would need VNet injection and a NAT gateway, a cost that isn't worth paying for dev in my case, so the dev storage account keeps its public endpoint.
+Dev skips prod's private networking to save cost. A storage firewall would need VNet injection and private endpoints, a cost that isn't worth paying for dev in my case, so the dev storage account keeps its public endpoint.
 
 ### Repository structure
 

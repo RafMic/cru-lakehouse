@@ -1,0 +1,166 @@
+name: terraform-apply-dev
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/envs/dev/**"
+      - "infra/envs/account/**"
+      - "infra/modules/**"
+      - ".github/workflows/terraform-apply-dev.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: terraform-apply-dev
+  cancel-in-progress: false
+
+jobs:
+  apply-azure:
+    name: apply infra/envs/dev/01-azure
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      workspace_url: ${{ steps.outputs.outputs.workspace_url }}
+      access_connector_id: ${{ steps.outputs.outputs.access_connector_id }}
+      storage_account_name: ${{ steps.outputs.outputs.storage_account_name }}
+      resource_group_name: ${{ steps.outputs.outputs.resource_group_name }}
+      landing_container_name: ${{ steps.outputs.outputs.landing_container_name }}
+      catalog_container_name: ${{ steps.outputs.outputs.catalog_container_name }}
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_dev_group_object_id: ${{ vars.DEV_GROUP_OBJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/dev/01-azure
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=dev/01-azure.tfstate"
+
+      - name: terraform apply
+        working-directory: infra/envs/dev/01-azure
+        run: terraform apply -auto-approve -no-color
+
+      - name: capture outputs
+        id: outputs
+        working-directory: infra/envs/dev/01-azure
+        run: |
+          {
+            printf 'workspace_url=%s\n' "$(terraform output -raw workspace_url)"
+            printf 'access_connector_id=%s\n' "$(terraform output -raw access_connector_id)"
+            printf 'storage_account_name=%s\n' "$(terraform output -raw storage_account_name)"
+            printf 'resource_group_name=%s\n' "$(terraform output -raw resource_group_name)"
+            printf 'landing_container_name=%s\n' "$(terraform output -raw landing_container_name)"
+            printf 'catalog_container_name=%s\n' "$(terraform output -raw catalog_container_name)"
+          } >> "$GITHUB_OUTPUT"
+
+  apply-account:
+    name: apply infra/envs/account
+    needs: apply-azure
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.DATABRICKS_ADMIN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_databricks_account_id: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+      TF_VAR_dev_group_object_id: ${{ vars.DEV_GROUP_OBJECT_ID }}
+      TF_VAR_prod_group_object_id: ${{ vars.PROD_GROUP_OBJECT_ID }}
+      TF_VAR_admins_group_object_id: ${{ vars.ADMINS_GROUP_OBJECT_ID }}
+      TF_VAR_dev_job_sp_application_id: ${{ vars.DEV_JOB_SP_APPLICATION_ID }}
+      TF_VAR_prod_job_sp_application_id: ${{ vars.PROD_JOB_SP_APPLICATION_ID }}
+      TF_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+      TF_VAR_dev_group_name: ${{ vars.DEV_GROUP_NAME }}
+      TF_VAR_prod_group_name: ${{ vars.PROD_GROUP_NAME }}
+      TF_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: export workspace IDs
+        env:
+          TFSTATE_RESOURCE_GROUP: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+        run: bash .github/scripts/export-workspace-ids.sh
+
+      - name: terraform init
+        working-directory: infra/envs/account
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=account.tfstate"
+
+      - name: terraform apply
+        working-directory: infra/envs/account
+        run: terraform apply -auto-approve -no-color -lock-timeout=15m
+
+  apply-databricks:
+    name: apply infra/envs/dev/02-databricks
+    needs: [apply-azure, apply-account]
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_databricks_host: ${{ needs.apply-azure.outputs.workspace_url }}
+      TF_VAR_access_connector_id: ${{ needs.apply-azure.outputs.access_connector_id }}
+      TF_VAR_storage_account_name: ${{ needs.apply-azure.outputs.storage_account_name }}
+      TF_VAR_resource_group_name: ${{ needs.apply-azure.outputs.resource_group_name }}
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_landing_container_name: ${{ needs.apply-azure.outputs.landing_container_name }}
+      TF_VAR_catalog_container_name: ${{ needs.apply-azure.outputs.catalog_container_name }}
+      TF_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+      TF_VAR_dev_job_sp_application_id: ${{ vars.DEV_JOB_SP_APPLICATION_ID }}
+      TF_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+      TF_VAR_dev_group_name: ${{ vars.DEV_GROUP_NAME }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/dev/02-databricks
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=dev/02-databricks.tfstate"
+
+      - name: terraform apply
+        working-directory: infra/envs/dev/02-databricks
+        run: terraform apply -auto-approve -no-color

@@ -1,0 +1,334 @@
+name: terraform-apply-prod
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: terraform-apply-prod
+  cancel-in-progress: false
+
+jobs:
+  plan-azure:
+    name: plan infra/envs/prod/01-azure
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_prod_group_object_id: ${{ vars.PROD_GROUP_OBJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/prod/01-azure
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=prod/01-azure.tfstate"
+
+      - name: terraform plan
+        working-directory: infra/envs/prod/01-azure
+        run: |
+          set -o pipefail
+          terraform plan -no-color -out=tfplan | tee plan-output.txt
+          summary=$(grep -E '^(Plan:|No changes)' plan-output.txt || echo 'Plan summary unavailable - see the job log')
+          {
+            printf '### Plan: `infra/envs/prod/01-azure`\n\n**%s**\n\n' "$summary"
+            printf '<details><summary>Show plan</summary>\n\n```\n'
+            cat plan-output.txt
+            printf '```\n\n</details>\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prod-01-azure-plan
+          path: infra/envs/prod/01-azure/tfplan
+          retention-days: 1
+
+  apply-azure:
+    name: apply infra/envs/prod/01-azure
+    needs: plan-azure
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      workspace_url: ${{ steps.outputs.outputs.workspace_url }}
+      workspace_id: ${{ steps.outputs.outputs.workspace_id }}
+      access_connector_id: ${{ steps.outputs.outputs.access_connector_id }}
+      storage_account_name: ${{ steps.outputs.outputs.storage_account_name }}
+      storage_account_id: ${{ steps.outputs.outputs.storage_account_id }}
+      resource_group_name: ${{ steps.outputs.outputs.resource_group_name }}
+      location: ${{ steps.outputs.outputs.location }}
+      landing_container_name: ${{ steps.outputs.outputs.landing_container_name }}
+      catalog_container_name: ${{ steps.outputs.outputs.catalog_container_name }}
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_prod_group_object_id: ${{ vars.PROD_GROUP_OBJECT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/prod/01-azure
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=prod/01-azure.tfstate"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: prod-01-azure-plan
+          path: infra/envs/prod/01-azure
+
+      - name: terraform apply
+        working-directory: infra/envs/prod/01-azure
+        run: terraform apply -no-color tfplan
+
+      - name: capture outputs
+        id: outputs
+        working-directory: infra/envs/prod/01-azure
+        run: |
+          {
+            printf 'workspace_url=%s\n' "$(terraform output -raw workspace_url)"
+            printf 'workspace_id=%s\n' "$(terraform output -raw workspace_id)"
+            printf 'access_connector_id=%s\n' "$(terraform output -raw access_connector_id)"
+            printf 'storage_account_name=%s\n' "$(terraform output -raw storage_account_name)"
+            printf 'storage_account_id=%s\n' "$(terraform output -raw storage_account_id)"
+            printf 'resource_group_name=%s\n' "$(terraform output -raw resource_group_name)"
+            printf 'location=%s\n' "$(terraform output -raw location)"
+            printf 'landing_container_name=%s\n' "$(terraform output -raw landing_container_name)"
+            printf 'catalog_container_name=%s\n' "$(terraform output -raw catalog_container_name)"
+          } >> "$GITHUB_OUTPUT"
+
+  plan-account:
+    name: plan infra/envs/account
+    needs: apply-azure
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.DATABRICKS_ADMIN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      TF_VAR_databricks_account_id: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+      TF_VAR_dev_group_object_id: ${{ vars.DEV_GROUP_OBJECT_ID }}
+      TF_VAR_prod_group_object_id: ${{ vars.PROD_GROUP_OBJECT_ID }}
+      TF_VAR_admins_group_object_id: ${{ vars.ADMINS_GROUP_OBJECT_ID }}
+      TF_VAR_dev_job_sp_application_id: ${{ vars.DEV_JOB_SP_APPLICATION_ID }}
+      TF_VAR_prod_job_sp_application_id: ${{ vars.PROD_JOB_SP_APPLICATION_ID }}
+      TF_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+      TF_VAR_dev_group_name: ${{ vars.DEV_GROUP_NAME }}
+      TF_VAR_prod_group_name: ${{ vars.PROD_GROUP_NAME }}
+      TF_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: export workspace IDs
+        env:
+          TFSTATE_RESOURCE_GROUP: ${{ vars.TFSTATE_RESOURCE_GROUP }}
+          TFSTATE_STORAGE_ACCOUNT: ${{ vars.TFSTATE_STORAGE_ACCOUNT }}
+        run: bash .github/scripts/export-workspace-ids.sh
+
+      - name: terraform init
+        working-directory: infra/envs/account
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=account.tfstate"
+
+      - name: terraform plan
+        working-directory: infra/envs/account
+        run: |
+          set -o pipefail
+          terraform plan -no-color -lock-timeout=15m -out=tfplan | tee plan-output.txt
+          summary=$(grep -E '^(Plan:|No changes)' plan-output.txt || echo 'Plan summary unavailable - see the job log')
+          {
+            printf '### Plan: `infra/envs/account`\n\n**%s**\n\n' "$summary"
+            printf '<details><summary>Show plan</summary>\n\n```\n'
+            cat plan-output.txt
+            printf '```\n\n</details>\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: account-plan
+          path: infra/envs/account/tfplan
+          retention-days: 1
+
+  apply-account:
+    name: apply infra/envs/account
+    needs: plan-account
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.DATABRICKS_ADMIN_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/account
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=account.tfstate"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: account-plan
+          path: infra/envs/account
+
+      - name: terraform apply
+        working-directory: infra/envs/account
+        run: terraform apply -no-color -lock-timeout=15m tfplan
+
+  plan-databricks:
+    name: plan infra/envs/prod/02-databricks
+    needs: [apply-azure, apply-account]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      DATABRICKS_TF_ENABLED_PF_RESOURCES: databricks_mws_ncc_private_endpoint_rule
+      TF_VAR_databricks_host: ${{ needs.apply-azure.outputs.workspace_url }}
+      TF_VAR_databricks_workspace_id: ${{ needs.apply-azure.outputs.workspace_id }}
+      TF_VAR_access_connector_id: ${{ needs.apply-azure.outputs.access_connector_id }}
+      TF_VAR_storage_account_id: ${{ needs.apply-azure.outputs.storage_account_id }}
+      TF_VAR_storage_account_name: ${{ needs.apply-azure.outputs.storage_account_name }}
+      TF_VAR_resource_group_name: ${{ needs.apply-azure.outputs.resource_group_name }}
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_landing_container_name: ${{ needs.apply-azure.outputs.landing_container_name }}
+      TF_VAR_catalog_container_name: ${{ needs.apply-azure.outputs.catalog_container_name }}
+      TF_VAR_location: ${{ needs.apply-azure.outputs.location }}
+      TF_VAR_databricks_account_id: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+      TF_VAR_databricks_admin_sp_application_id: ${{ vars.DATABRICKS_ADMIN_CLIENT_ID }}
+      TF_VAR_deploy_sp_application_id: ${{ vars.AZURE_CLIENT_ID }}
+      TF_VAR_prod_job_sp_application_id: ${{ vars.PROD_JOB_SP_APPLICATION_ID }}
+      TF_VAR_admins_group_name: ${{ vars.ADMINS_GROUP_NAME }}
+      TF_VAR_prod_group_name: ${{ vars.PROD_GROUP_NAME }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/prod/02-databricks
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=prod/02-databricks.tfstate"
+
+      - name: terraform plan
+        working-directory: infra/envs/prod/02-databricks
+        run: |
+          set -o pipefail
+          terraform plan -no-color -out=tfplan | tee plan-output.txt
+          summary=$(grep -E '^(Plan:|No changes)' plan-output.txt || echo 'Plan summary unavailable - see the job log')
+          {
+            printf '### Plan: `infra/envs/prod/02-databricks`\n\n**%s**\n\n' "$summary"
+            printf '<details><summary>Show plan</summary>\n\n```\n'
+            cat plan-output.txt
+            printf '```\n\n</details>\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: prod-02-databricks-plan
+          path: infra/envs/prod/02-databricks/tfplan
+          retention-days: 1
+
+  apply-databricks:
+    name: apply infra/envs/prod/02-databricks
+    needs: plan-databricks
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_USE_OIDC: true
+      DATABRICKS_TF_ENABLED_PF_RESOURCES: databricks_mws_ncc_private_endpoint_rule
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.6"
+
+      - name: terraform init
+        working-directory: infra/envs/prod/02-databricks
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="key=prod/02-databricks.tfstate"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: prod-02-databricks-plan
+          path: infra/envs/prod/02-databricks
+
+      - name: terraform apply
+        working-directory: infra/envs/prod/02-databricks
+        run: terraform apply -no-color tfplan

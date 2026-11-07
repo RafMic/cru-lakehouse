@@ -1,0 +1,49 @@
+misconfigurations:
+  - id: AZU-0012
+    paths:
+      - modules/storage_account/main.tf
+    statement: >-
+      The module denies network access by default. Dev workspace isn't VNet-injected,
+      and Databricks only supports a storage firewall with VNet injection.
+      Prod uses private endpoints instead.
+
+  - id: AZU-0012
+    paths:
+      - bootstrap/main.tf
+    statement: >-
+      Terraform state is reached from GitHub-hosted runners, which have no fixed IP range.
+      Access is Entra ID only (shared keys disabled).
+
+  - id: AZU-0057
+    paths:
+      - bootstrap/main.tf
+    statement: >-
+      The check only passes with classic Storage Analytics logging on the Queue service.
+      The Terraform state account doesn't use the Queue service. https://github.com/aquasecurity/trivy/discussions/11088
+
+  - id: AZU-0057
+    paths:
+      - modules/storage_account/main.tf
+    statement: >-
+      Blob and queue logs go to Azure Monitor through diagnostic settings, as Microsoft recommends.
+      The check only reads the inline queue_properties block, which azurerm 5 removed. https://github.com/aquasecurity/trivy/discussions/11088
+
+  - id: AZU-0058
+    paths:
+      - modules/storage_account/main.tf
+      - bootstrap/main.tf
+    statement: >-
+      GRS isn't worth the cost for this project - all data and infrastructure can be rebuilt.
+
+  - id: AZU-0060
+    paths:
+      - modules/storage_account/main.tf
+      - bootstrap/main.tf
+    statement: >-
+      Microsoft-managed keys are sufficient.
+
+  - id: AZU-0061
+    paths:
+      - bootstrap/main.tf
+    statement: >-
+      Microsoft recommends double encryption for compliance requirements, which this project doesn't have.
