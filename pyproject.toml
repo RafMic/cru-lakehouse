@@ -1,0 +1,46 @@
+[project]
+name = "cru-ingestion"
+version = "0.1.0"
+description = "CRU (Centralny Rejestr Umów) ingestion job for the Databricks lakehouse."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "requests>=2.34.2",
+  "tenacity>=9.2.1",
+  "tzdata>=2026.5",
+  "databricks-sdk>=0.152.0",
+]
+
+[project.scripts]
+compute_pending_days = "cru_ingestion.run:compute_pending_days_entrypoint"
+process_day = "cru_ingestion.run:process_day_entrypoint"
+
+[dependency-groups]
+dev = [
+  "freezegun>=1.5.5",
+  "pyspark>=4.2.0",
+  "pytest>=9.1.1",
+  "pytest-mock>=3.17.0",
+  "responses>=0.26.3",
+  "ruff>=0.17.0",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cru_ingestion"]
+
+[tool.ruff.lint.per-file-ignores]
+# spark is a global the Databricks runtime injects into notebooks and pipeline source files
+"src/bronze/bronze.py" = ["F821"]
+"src/silver/pipeline.py" = ["F821"]
+"src/gold/pipeline.py" = ["F821"]
+
+[tool.pytest.ini_options]
+# Silver and Gold aren't installed packages, so tests import them from src
+pythonpath = ["src"]
+
+[build-system]
+requires = ["hatchling>=1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cru_ingestion"]

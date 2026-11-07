@@ -21,7 +21,7 @@ Silver - streaming tables and materialized views (agreements, parties, addresses
    v
 Gold - star schema of materialized views (dim_buyer, dim_vendor, dim_geography, dim_date, dim_change, fact_agreement, fact_agreement_change, bridge_agreement_buyer, bridge_agreement_vendor)
    v
-Databricks SQL warehouse -> AI/BI dashboard
+Databricks SQL warehouse
 ```
 
 Ingestion, Bronze, Silver, and Gold all run in one Databricks workspace per environment (`dev`, `prod`), deployed as a single Declarative Automation Bundle. Terraform provisions the Azure resources underneath (resource group, storage, networking, the workspace) and the catalog, schemas, and landing volume in Unity Catalog.
