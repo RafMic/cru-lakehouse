@@ -4,25 +4,13 @@ Azure Databricks lakehouse ingesting Poland's Central Register of Contracts (Cen
 
 ## Architecture
 
-### Pipeline
+<img src="images/architecture.drawio.svg" alt="Prod architecture: the Azure Databricks account holds the workspace, serverless SQL warehouse, NCC private endpoints, and Unity Catalog. The Azure subscription holds the VNet-injected job and pipeline clusters, ADLS Gen2, and their networking. Users query through the workspace, GitHub Actions deploys both, and the clusters reach the CRU API through a NAT gateway and storage through private endpoints.">
 
-```
-CRU API
-   |  rate-limited with retries, tracked in a per-day ledger
-   v
-Landing zone - ADLS Gen2, Unity Catalog volume
-   |  Auto Loader, schema evolution on
-   v
-Bronze - Delta table
-   |  Lakeflow pipeline cru-transformation
-   v
-Silver - streaming tables and materialized views (agreements, parties, addresses, party_identities)
-   |  same pipeline
-   v
-Gold - star schema of materialized views (dim_buyer, dim_vendor, dim_geography, dim_date, dim_change, fact_agreement, fact_agreement_change, bridge_agreement_buyer, bridge_agreement_vendor)
-   v
-Databricks SQL warehouse
-```
+*Prod. Dev runs on the Databricks-managed VNet and keeps the storage account's public endpoint, see [Networking](#networking).*
+
+### Data flow
+
+<img src="images/data-flow.drawio.svg" alt="Data flow: the cru-ingestion job downloads agreements from the CRU API into the landing volume, loads them into Bronze with Auto Loader, and runs the cru-transformation pipeline, which builds Silver and Gold for the SQL warehouse. The landing files are stored in the landing container of ADLS Gen2, and the tables in its unity-catalog container.">
 
 Ingestion, Bronze, Silver, and Gold all run in one Databricks workspace per environment (`dev`, `prod`), deployed as a single Declarative Automation Bundle. Terraform provisions the Azure resources underneath (resource group, storage, networking, the workspace) and the catalog, schemas, and landing volume in Unity Catalog.
 
@@ -39,6 +27,10 @@ Each run:
    3. downloads every agreement's full record and saves it unchanged, as a JSON file, in the landing zone.
    4. writes the result, success or failure, to the ledger.
 3. **Updates the tables:** Bronze loads the new files, which Auto Loader finds through storage file events, then Silver and Gold are refreshed.
+
+<img src="images/ingestion-job-run.png" alt="Successful cru-ingestion run in dev" width="840">
+
+*A dev backfill of one day.*
 
 Requests to the API are spaced out and retried after temporary errors, waiting as long as the API asks, up to 30 seconds. To process only a specific period, run the job with `backfill` set to `1` and `date_from` / `date_to` set to the first and last day, as `YYYY-MM-DD`. A backfill processes only the days in that range that the ledger hasn't recorded as successful. A successful day doesn't need fetching again, because editing an agreement updates its modification date, and the nightly run fetches it under that new date.
 
@@ -157,9 +149,6 @@ Run `terraform-apply-dev.yml` from the Actions tab. It also runs on pushes to `m
 ### 3. Dev bundle
 
 After the step 2 run succeeds, run `databricks-deploy-dev.yml` from the Actions tab. It runs `databricks bundle deploy -t dev`, which deploys the `cru-ingestion` job and the `cru-transformation` pipeline. It also runs on pushes to `main` that change `databricks.yml`, `resources/`, `src/`, `pyproject.toml`, or `uv.lock`.
-
-Pull requests that change the bundle run `databricks-checks.yml`, which runs `databricks bundle validate` for the `dev` and `prod` targets against their workspaces, skipping `prod` until its infrastructure is applied.
-
 ### 4. Prod (gated, manual trigger)
 
 Run `terraform-apply-prod.yml`. It applies three root modules in order, and before each one it writes the plan to the run summary and waits for a `prod` reviewer to approve it:
@@ -170,11 +159,19 @@ Run `terraform-apply-prod.yml`. It applies three root modules in order, and befo
 
 Then run `databricks-deploy-prod.yml`, which also waits for a `prod` reviewer and deploys the bundle. Both run only from `main`.
 
+## Pull request checks
+
+Each check runs on pull requests to `main` that change the files it covers.
+
+- `terraform-checks.yml` checks formatting and runs `terraform validate` on every root module, TFLint, `terraform test` on the `storage_account` and `service_principal` modules, and a Trivy scan that fails on misconfigurations not accepted in `.trivyignore.yaml`. It also plans dev, prod, and the account root module and posts each plan as a pull request comment, updated on every push.
+- `python-checks.yml` runs ruff and the unit tests.
+- `databricks-checks.yml` validates the bundle for the `dev` and `prod` targets, skipping `prod` until its infrastructure is applied.
+
 ## Design decisions
 
 ### Dev without network isolation
 
-Dev skips prod's private networking to save cost. A storage firewall would need VNet injection and private endpoints, a cost that isn't worth paying for dev in my case, so the dev storage account keeps its public endpoint.
+Dev skips prod's private networking to save cost. A storage firewall would need VNet injection and private endpoints, a cost that isn't worth paying for dev in my case, so the dev storage account keeps its public endpoint. This trade-off depends on the Databricks-managed VNet, which Microsoft [plans to deprecate](https://learn.microsoft.com/azure/databricks/security/network/classic/#deploy-a-workspace-in-your-own-virtual-network) for new classic workspaces. A future from-scratch deployment of dev will then need its own VNet, still without private endpoints.
 
 ### Repository structure
 
@@ -185,6 +182,10 @@ Keeping the platform in one repository lets each layer be read next to the layer
 A day that fails stays without a successful attempt in the [ledger](#ingestion), so the next run downloads it again, while the other days carry on. The `bronze` task runs with `run_if: ALL_DONE`, so Bronze, Silver, and Gold still load whatever was downloaded when some days failed. The job run ends as Succeeded with failures, since its last task succeeded, and the failed task sends the alert email.
 
 ## Known issues
+
+### Bot protection on the CRU API
+
+As of November 2026, the CRU API is behind Imperva bot protection. In tests, a client sending one request every 2 seconds or faster was blocked after about 20 requests, and for up to several minutes every request got a 200 response with an HTML page saying "Request unsuccessful" instead of JSON. The job sends up to 5 requests a second for each day, so each attempt at a day is blocked after about 15 agreements and recorded as failed. The day's retries continue with the agreements still missing, but that can't keep up with a register that averages over 10,000 changed agreements a day. At one request every 3 seconds, which wasn't blocked in a 100-request test, the roughly 1.5 million agreements registered by November 2026 would take almost two months to download.
 
 ### More than 10,000 changes in one voivodeship on one day
 
