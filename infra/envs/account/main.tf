@@ -17,9 +17,9 @@ locals {
   # Only environments whose workspace exists get workspace assignments
   workspace_access = merge([
     for env, cfg in local.environments : {
-      "${env}_group"  = { workspace_id = cfg.workspace_id, principal_id = databricks_group.environment[env].id }
-      "${env}_job_sp" = { workspace_id = cfg.workspace_id, principal_id = databricks_service_principal.job[env].id }
-      "${env}_admins" = { workspace_id = cfg.workspace_id, principal_id = databricks_group.admins.id }
+      "${env}_group"  = { workspace_id = cfg.workspace_id, principal_id = databricks_group.environment[env].id, permission = "USER" }
+      "${env}_job_sp" = { workspace_id = cfg.workspace_id, principal_id = databricks_service_principal.job[env].id, permission = "USER" }
+      "${env}_admins" = { workspace_id = cfg.workspace_id, principal_id = databricks_group.admins.id, permission = "ADMIN" }
     } if cfg.workspace_id != null
   ]...)
 }
@@ -73,5 +73,5 @@ resource "databricks_mws_permission_assignment" "workspace_access" {
 
   workspace_id = each.value.workspace_id
   principal_id = each.value.principal_id
-  permissions  = ["USER"] # Capabilities come from Unity Catalog grants and the bundle's permissions
+  permissions  = [each.value.permission]
 }
